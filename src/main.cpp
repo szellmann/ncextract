@@ -185,84 +185,164 @@ int main(int argc, char** argv)
         }
         NcVar* outvar = outfile.add_var(var->name(), var->type(), var->num_dims(), &dims[0]);
 
+        // identify largest dim, if dim (nearly) exceeds main memory, split along that dim
+        int maxdim = -1;
+        long maxdimsize = 0;
+        long totallen = 1;
+        for (int i = 0; i < var->num_dims(); ++i)
+        {
+            NcDim* dim = var->get_dim(i);
+            if (dim->size() > maxdimsize)
+            {
+                maxdim = i;
+                maxdimsize = dim->size();
+            }
+            totallen *= dim->size();
+        }
+
+        // TODO: support other data types
+        totallen *= sizeof(float);
+
+        // TODO: configurable page size
+        const unsigned long pagesize = 1000000000;
 #ifdef __linux__
         struct sysinfo info;
         sysinfo(&info);
+        if (pagesize >= info.freeram)
+        {
+            std::cerr << "Warning: page size exceeds free memory" << std::endl;
+        }
 #endif
 
-        std::vector<long> cur;
-        std::vector<long> counts;
-        long len = 1;
-        for (int i = 0; i < var->num_dims(); ++i)
+        int numpages = 1;
+        long pagesizedim = var->get_dim(maxdim)->size();
+        if (totallen < pagesize)
         {
-            cur.push_back(0);
-            const NcDim* dim = var->get_dim(i);
-            counts.push_back(dim->size());
-            len *= dim->size();
-            if (len >= info.freeram)
+        }
+        else
+        {
+            long mul = 1;
+            for (int i = 0; i < var->num_dims(); ++i)
             {
-                // TODO: paging
-                std::cerr << "Error: variable " << var->name() << " too large to completely fit into main memory" << std::endl;
-                infile.close();
-                outfile.close();
-                return EXIT_FAILURE;
+                if (i != maxdim)
+                {
+                    NcDim* dim = var->get_dim(i);
+                    mul *= dim->size();
+                }
+            }
+            // TODO: support other data types
+            mul *= sizeof(float);
+
+            pagesizedim = pagesize / mul;
+            numpages = var->get_dim(maxdim)->size() / pagesizedim;
+            if (var->get_dim(maxdim)->size() % pagesizedim > 0)
+            {
+                ++numpages;
             }
         }
 
-        var->set_cur(&cur[0]);
-        outvar->set_cur(&cur[0]);
-        switch (outvar->type())
+        std::vector< std::vector<long> > curvec;
+        std::vector< std::vector<long> > countsvec;
+        std::vector<long> lengths;
+
+        int pages = numpages > 0 ? numpages : 1;
+        for (int p = 0; p < pages; ++p)
         {
-        case ncByte:
-        {
-            ncbyte* barr = new ncbyte[len];
-            var->get(barr, &counts[0]);
-            outvar->put(barr, &counts[0]);
-            delete[] barr;
-            break;
+            long len = 1;
+            std::vector<long> cur;
+            std::vector<long> counts;
+            for (int i = 0; i < var->num_dims(); ++i)
+            {
+                NcDim* dim = var->get_dim(i);
+                long current = 0;
+                long count = dim->size();
+                if (i == maxdim)
+                {
+                    current = pagesizedim * p;
+                    count = pagesizedim;
+                    if (p == pages -1)
+                    {
+                        if (dim->size() % pagesizedim != 0)
+                        {
+                            count = dim->size() % pagesizedim;
+                        }
+                    }
+                }
+                cur.push_back(current);
+                counts.push_back(count);
+                len *= count;
+            }
+            curvec.push_back(cur);
+            countsvec.push_back(counts);
+            lengths.push_back(len);
         }
-        case ncChar:
+
+        std::vector< std::vector<long> >::const_iterator it1;
+        std::vector< std::vector<long> >::const_iterator it2;
+        std::vector<long>::const_iterator it3;
+
+        for (it1 = curvec.begin(), it2 = countsvec.begin(), it3 = lengths.begin();
+             it1 != curvec.end() && it2 != countsvec.end() && it3 != lengths.end(); ++it1, ++it2, ++it3)
         {
-            char* carr = new char[len];
-            var->get(carr, &counts[0]);
-            outvar->put(carr, &counts[0]);
-            delete[] carr;
-            break;
-        }
-        case ncShort:
-        {
-            short* sarr = new short[len];
-            var->get(sarr, &counts[0]);
-            outvar->put(sarr, &counts[0]);
-            delete[] sarr;
-            break;
-        }
-        case ncInt:
-        {
-            long* larr = new long[len];
-            var->get(larr, &counts[0]);
-            outvar->put(larr, &counts[0]);
-            delete[] larr;
-            break;
-        }
-        case ncFloat:
-        {
-            float* farr = new float[len];
-            var->get(farr, &counts[0]);
-            outvar->put(farr, &counts[0]);
-            delete[] farr;
-            break;
-        }
-        case ncDouble:
-        {
-            double* darr = new double[len];
-            var->get(darr, &counts[0]);
-            outvar->put(darr, &counts[0]);
-            delete[] darr;
-            break;
-        }
-        default:
-            break;
+            std::vector<long> cur = *it1;
+            std::vector<long> counts = *it2;
+            long len = *it3;
+
+            var->set_cur(&cur[0]);
+            outvar->set_cur(&cur[0]);
+            switch (outvar->type())
+            {
+            case ncByte:
+            {
+                ncbyte* barr = new ncbyte[len];
+                var->get(barr, &counts[0]);
+                outvar->put(barr, &counts[0]);
+                delete[] barr;
+                break;
+            }
+            case ncChar:
+            {
+                char* carr = new char[len];
+                var->get(carr, &counts[0]);
+                outvar->put(carr, &counts[0]);
+                delete[] carr;
+                break;
+            }
+            case ncShort:
+            {
+                short* sarr = new short[len];
+                var->get(sarr, &counts[0]);
+                outvar->put(sarr, &counts[0]);
+                delete[] sarr;
+                break;
+            }
+            case ncInt:
+            {
+                long* larr = new long[len];
+                var->get(larr, &counts[0]);
+                outvar->put(larr, &counts[0]);
+                delete[] larr;
+                break;
+            }
+            case ncFloat:
+            {
+                float* farr = new float[len];
+                var->get(farr, &counts[0]);
+                outvar->put(farr, &counts[0]);
+                delete[] farr;
+                break;
+            }
+            case ncDouble:
+            {
+                double* darr = new double[len];
+                var->get(darr, &counts[0]);
+                outvar->put(darr, &counts[0]);
+                delete[] darr;
+                break;
+            }
+            default:
+                break;
+            }
         }
     }
 
